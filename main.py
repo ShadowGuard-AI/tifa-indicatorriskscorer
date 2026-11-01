@@ -6,6 +6,7 @@ import feedparser
 import validators
 import tldextract
 import os
+import sys
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -63,10 +64,42 @@ def validate_indicator(indicator, indicator_type=None):
         return None
 
 
+def _feed_severity(data):
+    """Returns a numeric severity found in a feed record, or None."""
+    if isinstance(data, dict):
+        for key in ("severity", "risk_score", "threat_score"):
+            value = data.get(key)
+            if isinstance(value, (int, float)):
+                return max(0.0, min(10.0, float(value)))
+        for value in data.values():
+            found = _feed_severity(value)
+            if found is not None:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = _feed_severity(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _response_concerns_indicator(data, indicator):
+    """True only when the feed response actually mentions the indicator."""
+    try:
+        body = json.dumps(data)
+    except Exception:
+        body = str(data)
+    return indicator in body or indicator.lower() in body.lower()
+
+
 def fetch_data_from_feed(indicator, feed_name, feed_config):
     """
     Fetches data from a specified threat intelligence feed.
-    Handles different feed types (JSON, RSS).
+
+    Returns a tuple (data, succeeded). succeeded is True when the feed
+    was actually queried, even when its response does not concern the
+    indicator. data is the feed record only when the response concerns
+    the indicator; otherwise data is None.
     """
     try:
         url = feed_config["url"]
@@ -74,86 +107,89 @@ def fetch_data_from_feed(indicator, feed_name, feed_config):
 
         if feed_type == "json":
             if "apikey" in feed_config:
-                # Add API key to headers or parameters as required by the API
-                headers = {"X-API-Key": feed_config["apikey"]} # Example header - adjust as necessary
-                params = {"ip": indicator} # Example parameter - adjust as necessary
-
-                response = requests.get(url, params=params, headers=headers)
-
+                headers = {"X-API-Key": feed_config["apikey"]}
+                params = {"ip": indicator}
+                response = requests.get(url, params=params, headers=headers, timeout=10)
             elif "indicator_path" in feed_config:
-                 url = url.replace("{indicator}", indicator)  # Dynamically replace indicator
-
-                 response = requests.get(url)
-
+                 url = url.replace("{indicator}", indicator)
+                 response = requests.get(url, timeout=10)
             else:
                 params = {"ip": indicator}
-                # Every JSON feed gets the indicator under a parameter literally named ip, whatever type was validated, and no request anywhere in this function sets a timeout. A domain or hash lookup is sent in a shape built for addresses, and a feed that hangs holds the whole run with it.
-                response = requests.get(url, params=params)
+                response = requests.get(url, params=params, timeout=10)
 
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+            response.raise_for_status()
             data = response.json()
-            return data
+            if not _response_concerns_indicator(data, indicator):
+                logging.info(f"Feed {feed_name} responded but its response does not concern {indicator}.")
+                return None, True
+            return data, True
 
         elif feed_type == "rss":
-            feed = feedparser.parse(url)
-            # Check for errors in feed parsing
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            feed = feedparser.parse(response.content)
             if feed.bozo:
                 raise Exception(f"Error parsing RSS feed: {feed.bozo_exception}")
-
             for entry in feed.entries:
-                if indicator in entry.summary or indicator in entry.title:
-                    return entry  # Return the entire entry
-
-            return None  # Indicator not found in RSS feed
+                title = getattr(entry, "title", "") or entry.get("title", "") if isinstance(entry, dict) else ""
+                summary = getattr(entry, "summary", "") or ""
+                if not isinstance(entry, dict):
+                    text = f"{title} {summary} {getattr(entry, 'description', '') or ''}"
+                else:
+                    text = f"{entry.get('title','')} {entry.get('summary','')} {entry.get('description','')}"
+                if indicator in text:
+                    return entry, True
+            return None, True
 
         else:
             logging.error(f"Unsupported feed type: {feed_type} for {feed_name}")
-            return None
+            return None, False
 
     except requests.exceptions.RequestException as e:
         logging.error(f"Error fetching data from {feed_name}: {e}")
-        return None
+        return None, False
     except json.JSONDecodeError as e:
         logging.error(f"Error decoding JSON from {feed_name}: {e}")
-        return None
+        return None, False
     except Exception as e:
         logging.error(f"Error processing feed {feed_name}: {e}")
-        return None
+        return None, False
 
 
 
 def analyze_indicator(indicator, feed_sources):
     """
-    Analyzes the indicator against multiple threat intelligence feeds and calculates a risk score.
+    Analyzes the indicator against multiple feeds and calculates a risk score.
+
+    Score formula: for each feed whose response actually concerns the
+    indicator, add severity times the feed reputation. Severity comes
+    from a numeric severity, risk_score, or threat_score field in the
+    feed record when one is present, otherwise from the feed config
+    severity when set, otherwise the default severity of 5.
+
+    Returns (total_score, feed_matches, succeeded_count).
     """
     total_score = 0
     feed_matches = []
+    succeeded = 0
 
     for feed_name, feed_config in feed_sources.items():
         logging.info(f"Checking indicator against {feed_name}...")
-        data = fetch_data_from_feed(indicator, feed_name, feed_config)
-
+        data, ok = fetch_data_from_feed(indicator, feed_name, feed_config)
+        if ok:
+            succeeded += 1
         if data:
             logging.info(f"Indicator found in {feed_name}.")
             feed_matches.append(feed_name)
-
-            # Determine severity and reputation based on feed data (example logic)
-            severity = DEFAULT_SEVERITY  # Default severity
-            if "severity" in feed_config:
-                severity = feed_config["severity"]
-
-            reputation = feed_config.get("reputation", 0.5) # Use .get() to avoid KeyError
-
-            # Add feed-specific logic here to extract severity or other relevant information from the data.
-            # For example, if the AlienVault OTX feed returns a 'pulse' count, you might weight severity based on that.
-
-            # Severity comes from the feed configuration, or my default of 5, never from the data the feed returned. Any non empty JSON body counts as a match, including a response that says the indicator is clean, so the score measures how many feeds answered with something, weighted by numbers I assigned the feeds myself.
-            total_score += severity * reputation
-
+            severity = _feed_severity(data)
+            if severity is None:
+                severity = feed_config.get("severity", DEFAULT_SEVERITY)
+            reputation = feed_config.get("reputation", 0.5)
+            total_score += float(severity) * float(reputation)
         else:
             logging.info(f"Indicator not found in {feed_name}.")
 
-    return total_score, feed_matches
+    return total_score, feed_matches, succeeded
 
 
 def load_config_file(config_file_path):
@@ -212,7 +248,7 @@ def main():
     validated_type = validate_indicator(indicator, indicator_type)
     if not validated_type:
         print("Invalid indicator. Please provide a valid IP address, domain, URL, or hash.")
-        return
+        sys.exit(1)
 
     logging.info(f"Analyzing indicator: {indicator} (Type: {validated_type})")
 
@@ -228,7 +264,12 @@ def main():
             logging.warning("Using default feed sources due to configuration file error.")
 
     # Analyze the indicator
-    total_score, feed_matches = analyze_indicator(indicator, feed_sources)
+    total_score, feed_matches, succeeded = analyze_indicator(indicator, feed_sources)
+
+    if succeeded == 0:
+        print("No feed could be queried, so no risk score was computed.")
+        logging.error("All feeds failed; no score was computed.")
+        sys.exit(1)
 
     logging.info(f"Total risk score: {total_score}")
     logging.info(f"Matched feeds: {feed_matches}")
@@ -238,7 +279,10 @@ def main():
     if args.output_file:
         save_results(indicator, total_score, feed_matches, args.output_file)
     else:
-        print(f"Risk Score: {total_score}")
+        if feed_matches:
+            print(f"Risk Score: {total_score}")
+        else:
+            print(f"Risk Score: {total_score} (checked: {succeeded} feed(s) queried, none reported the indicator)")
         print(f"Matched Feeds: {feed_matches}")
 
 
