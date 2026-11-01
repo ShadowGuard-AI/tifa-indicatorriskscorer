@@ -50,7 +50,9 @@ def validate_indicator(indicator, indicator_type=None):
              if not validators.url(indicator):
                 raise ValueError("Invalid URL.")
              return "url"
+        # Hash is reachable only when the operator names the type. My autodetect chain above tries address, domain, then URL, and a bare hash falls off the end into the could not determine error, so the type I advertise as supported is the one type auto mode can never find.
         elif indicator_type == "hash":
+            # Length is the entire hash test. A 64 character sentence fragment with spaces passes as a hash, and a genuine SHA-512 digest at 128 characters is refused, because I never look at whether the characters are hex.
             if not (len(indicator) == 32 or len(indicator) == 40 or len(indicator) == 64): # rudimentary hash validation
                 raise ValueError("Invalid hash (length should be 32, 40, or 64 characters).")
             return "hash"
@@ -85,6 +87,7 @@ def fetch_data_from_feed(indicator, feed_name, feed_config):
 
             else:
                 params = {"ip": indicator}
+                # Every JSON feed gets the indicator under a parameter literally named ip, whatever type was validated, and no request anywhere in this function sets a timeout. A domain or hash lookup is sent in a shape built for addresses, and a feed that hangs holds the whole run with it.
                 response = requests.get(url, params=params)
 
             response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
@@ -144,6 +147,7 @@ def analyze_indicator(indicator, feed_sources):
             # Add feed-specific logic here to extract severity or other relevant information from the data.
             # For example, if the AlienVault OTX feed returns a 'pulse' count, you might weight severity based on that.
 
+            # Severity comes from the feed configuration, or my default of 5, never from the data the feed returned. Any non empty JSON body counts as a match, including a response that says the indicator is clean, so the score measures how many feeds answered with something, weighted by numbers I assigned the feeds myself.
             total_score += severity * reputation
 
         else:
@@ -217,6 +221,7 @@ def main():
     feed_sources = FEED_SOURCES
     if args.config_file:
         custom_feeds = load_config_file(args.config_file)
+        # An empty JSON object in the config file is falsy, so a file that deliberately defines no feeds falls back to my built in defaults with only a log warning. The operator asked for no feeds and gets three.
         if custom_feeds:
             feed_sources = custom_feeds
         else:
